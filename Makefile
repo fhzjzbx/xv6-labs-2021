@@ -1,4 +1,4 @@
-
+\
 # To compile and run with a lab solution, set the lab name in lab.mk
 # (e.g., LAB=util).  Run make grade to test solution with the lab's
 # grade script (e.g., grade-lab-util).
@@ -91,7 +91,7 @@ LD = $(TOOLPREFIX)ld
 OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 
-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
+CFLAGS = -Wall -Werror -Wno-error=infinite-recursion -O -fno-omit-frame-pointer -ggdb
 
 ifdef LAB
 LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
