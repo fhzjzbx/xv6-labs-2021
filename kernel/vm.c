@@ -281,6 +281,43 @@ freewalk(pagetable_t pagetable)
   kfree((void*)pagetable);
 }
 
+/*
+ * 递归打印页表中的有效条目
+ * level: 在 Sv39 页表树中的深度
+ */
+static void
+vmprintwalk(pagetable_t pagetable, int level)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+
+    // 忽略无效的页表条目
+    if((pte & PTE_V) == 0)
+      continue;
+
+    uint64 pa = PTE2PA(pte);
+
+    // 每一级打印一个 ".."
+    for(int j = 0; j < level; j++)
+      printf(" ..");
+
+    printf("%d: pte %p pa %p\n", i, pte, pa);
+
+    // 没有读/写/执行权限的有效 PTE 指向一个低级别的页表页
+    if((pte & (PTE_R | PTE_W | PTE_X)) == 0){
+      vmprintwalk((pagetable_t)pa, level + 1);
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  vmprintwalk(pagetable, 1);
+}
+
+
 // Free user memory pages,
 // then free page-table pages.
 void
