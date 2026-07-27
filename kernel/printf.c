@@ -115,6 +115,48 @@ printf(char *fmt, ...)
 }
 
 void
+backtrace(void)
+{
+  uint64 fp;
+  uint64 stack_bottom;
+  uint64 stack_top;
+
+  printf("backtrace:\n");
+
+  // 读取当前函数的帧指针 s0。
+  fp = r_fp();
+
+  // 当前内核栈占一个页，计算这一页的边界。
+  stack_bottom = PGROUNDDOWN(fp);
+  stack_top = PGROUNDUP(fp);
+
+  /*
+   * 每个栈帧中：
+   *   fp - 8  保存返回地址
+   *   fp - 16 保存调用者的帧指针
+   */
+  while(fp >= stack_bottom + 16 && fp < stack_top){
+    uint64 return_address;
+    uint64 previous_fp;
+
+    return_address = *(uint64 *)(fp - 8);
+    previous_fp = *(uint64 *)(fp - 16);
+
+    printf("%p\n", return_address);
+
+    /*
+     * 调用者的栈帧通常位于更高地址。
+     * 如果帧指针没有向上移动，或者已经到达栈页边界，
+     * 则停止遍历，避免无限循环或非法访问。
+     */
+    if(previous_fp <= fp || previous_fp >= stack_top)
+      break;
+
+    fp = previous_fp;
+  }
+}
+
+void
 panic(char *s)
 {
   pr.locking = 0;
