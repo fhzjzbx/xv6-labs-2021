@@ -77,9 +77,36 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if(which_dev == 2){
+    /*
+     * 只有注册了 alarm，并且当前没有正在执行 handler 时，
+     * 才累计该进程的 alarm tick。
+     */
+    if(p->alarm_interval > 0 && p->alarm_active == 0){
+      p->alarm_ticks++;
 
+      if(p->alarm_ticks >= p->alarm_interval){
+        // 当前周期完成，下一周期重新计数。
+        p->alarm_ticks = 0;
+
+        // 标记处理函数正在运行，阻止重入。
+        p->alarm_active = 1;
+
+        // 保存被时钟中断时的全部用户寄存器。
+        memmove(&p->alarm_trapframe,
+                p->trapframe,
+                sizeof(struct trapframe));
+
+        /*
+         * usertrapret() 返回用户态时，将从 epc 指向的位置执行。
+         * 因此把 epc 改成用户处理函数地址。
+         */
+        p->trapframe->epc = p->alarm_handler;
+      }
+    }
+
+    yield();
+  }
   usertrapret();
 }
 
