@@ -1,0 +1,60 @@
+RISC-V assembly
+
+1. Function arguments are passed in registers a0 through a7. In the call
+
+       printf("%d %d\n", f(8)+1, 13);
+
+   a0 contains the address of the format string, a1 contains 12, and a2
+   contains 13. Therefore, the value 13 is stored in register a2.
+
+2. There is no actual call instruction from main to f. The compiler evaluates
+   f(8)+1 at compile time and directly loads 12 into a1 with the instruction
+
+       li a1, 12
+
+   There is also no actual call from f to g. The body of g is inlined into f,
+   and f directly executes
+
+       addiw a0, a0, 3
+
+   Thus, the compiler performs function inlining and constant folding.
+
+3. The address of printf is 0x616. This is shown by both the printf symbol
+
+       0000000000000616 <printf>:
+
+   and the call instruction in main:
+
+       jalr 1510(ra) # 616 <printf>
+
+4. The jalr instruction that calls printf is located at address 0x34. The
+   instruction immediately following it is located at address 0x38.
+   Therefore, after the jalr instruction executes, ra contains 0x38.
+
+5. The program prints
+
+       HE110 World
+
+   The decimal value 57616 is hexadecimal 0xE110. In this implementation,
+   printf uses uppercase hexadecimal digits. Since the machine is
+   little-endian, the integer 0x00646c72 is stored in memory as the byte
+   sequence 0x72, 0x6c, 0x64, and 0x00, which represents the string "rld".
+
+6. On a big-endian machine, i should be initialized as
+
+       unsigned int i = 0x726c6400;
+
+   This produces the byte sequence 0x72, 0x6c, 0x64, and 0x00 from low to
+   high memory addresses. The value 57616 does not need to change because
+   endianness changes the in-memory byte order of a value, not its numerical
+   value. It will still be printed as E110.
+
+7. In the call
+
+       printf("x=%d y=%d", 3);
+
+   x is printed as 3, but the value printed after y= is indeterminate. The
+   format string requires two integer arguments, while the caller supplies
+   only one. printf therefore reads an unspecified value from the argument
+   register or argument-save area corresponding to the missing argument.
+   This invocation has undefined behavior.
