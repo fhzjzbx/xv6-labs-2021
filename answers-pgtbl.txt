@@ -1,0 +1,31 @@
+1. Which other xv6 system call(s) could be made faster using this shared page?
+Explain how.
+
+The uptime system call could be accelerated by using a read-only page shared
+between the kernel and user space. The kernel could maintain the current
+number of clock ticks in this page, while user programs could read the value
+directly without executing an ecall and entering the kernel. The page should
+be mapped with user-readable but not user-writable permissions, so that user
+programs cannot modify the kernel-maintained value. Since the value may be
+updated concurrently by the kernel, the implementation should also ensure
+that the user observes a consistent value.
+
+2. Explain the output of vmprint in terms of Figure 3-4.
+
+Virtual page 0 contains the executable code and initial data of the init
+process. The mappings at the lower levels of the page-table tree translate
+this user virtual page to the corresponding physical page.
+
+Virtual page 1 is the guard page located below the user stack. Its PTE does
+not contain the PTE_U permission bit, so code running in user mode cannot read
+from or write to this page. An attempted user access would cause a page fault.
+
+Virtual page 2 contains the initial user stack. The stack stores the argument
+strings, the argv array, and the initial stack frames used when the process
+begins execution.
+
+The third-to-last page in the user virtual address space is USYSCALL. It
+contains a struct usyscall whose pid field stores the current process ID.
+The page is mapped with PTE_R and PTE_U, but without PTE_W, so the process can
+read the PID directly through ugetpid() but cannot modify it. The two pages
+above it are TRAPFRAME and TRAMPOLINE.
