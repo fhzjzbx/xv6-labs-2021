@@ -303,23 +303,40 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
+
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    /*
+     * 只有原本可写的页面才转成 COW。
+     * 原本只读的代码页继续保持普通只读状态。
+     */
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+
+      // 同时修改父进程页表项。
+      *pte = PA2PTE(pa) | flags;
     }
+
+    /*
+     * 子进程直接映射相同物理页，
+     * 不再调用 kalloc() 和 memmove()。
+     */
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    // 子进程页表新增了一个物理页引用。
+    krefinc(pa);
   }
+
+
   return 0;
 
  err:
@@ -340,6 +357,80 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+/*
+ * 解决 copy-on-write 页面上的写入错误。
+ *
+ * pagetable： 当前进程的用户页表
+ * va       ： 导致页面错误的虚拟地址
+ *
+ * 成功返回 0，失败返回 -1。
+ */
+int
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint64 flags;
+  char *mem;
+
+  // 用户虚拟地址必须低于MAXVA
+  if(va >= MAXVA)
+    return -1;
+
+  // 页表操作需要页对齐的地址
+  va = PGROUNDDOWN(va);
+
+  // 在不创建新的页表页面的情况下定位最后一个PTE
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+
+  /*
+   * 映射必须：
+   * 1. 是有效的；
+   * 2. 能从用户模式访问；
+   * 3. 实际上被标记为写时复制（COW）映射
+   */
+  if((*pte & PTE_V) == 0)
+    return -1;
+
+  if((*pte & PTE_U) == 0)
+    return -1;
+
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  // 获取物理页并保留原始的PTE标志
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  // 为发生故障的进程分配一个私有物理页面
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  // 复制原页面的全部内容
+  memmove(mem, (char *)pa, PGSIZE);
+
+  /*
+   * 替换当前进程的 PTE：
+   * 指向新的物理页；
+   * 恢复写权限；
+   * 移除 COW 标记；
+   * 保留其他原始权限。
+   */
+  flags = (flags | PTE_W) & ~PTE_COW;
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  /*
+   * 当前的进程不再引用旧的物理页。
+   * kfree() 只有在它的引用计数变为零时才会真正释放它
+   */
+  kfree((void *)pa);
+
+  return 0;
+}
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -347,9 +438,42 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    if(va0 >= MAXVA)
+      return -1;
+
+    pte = walk(pagetable, va0, 0);
+    
+    /*
+     * 查找目标虚拟页面对应的最终页表项。
+     * 第三个参数为 0，表示只查找已有映射，不为非法地址创建新的页表。
+     */
+    if(pte == 0)
+      return -1;
+
+    /*
+     * 目标页表项必须有效，并且必须是用户空间页面。
+     */
+    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+
+    /*
+     * 如果目标页面被标记为 COW，说明该页面可能仍由多个进程共享。内核不能直接向共享物理页写入，
+     * 必须先为当前页表创建一个私人可写副本。
+     */
+    if(*pte & PTE_COW){
+      if(cowalloc(pagetable, va0) < 0)
+        return -1;
+    }
+
+    /*
+     * cowalloc() 可能已经把该虚拟页重新映射到了新的物理页面
+     * 因此这里必须重新获取物理地址。
+     */
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;

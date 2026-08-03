@@ -65,7 +65,23 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  }else if(r_scause() == 15){
+    /*
+     * 存储器/AMO 页面错误
+     * stval 包含导致页面错误的用户虚拟地址
+     */
+    uint64 faultva = r_stval();
+
+    /*
+     * 地址必须属于进程的用户地址空间
+     * 并且它必须标识一个有效的 COW 页
+     */
+    if(faultva >= p->sz ||
+      cowalloc(p->pagetable, faultva) < 0){
+      p->killed = 1;
+    }
+
+  }else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
