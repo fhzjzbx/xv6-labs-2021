@@ -14,6 +14,14 @@ struct entry {
   struct entry *next;
 };
 struct entry *table[NBUCKET];
+
+/*
+ * 为每个哈希桶分别设置一把互斥锁
+ * 不同桶上的操作可以并行执行
+ * 同一个桶上的操作需要互斥
+ */
+pthread_mutex_t bucket_locks[NBUCKET];
+
 int keys[NKEYS];
 int nthread = 1;
 
@@ -43,6 +51,13 @@ void put(int key, int value)
 
   // is the key already present?
   struct entry *e = 0;
+
+  /*
+   * 同一哈希桶中的链表是共享数据
+   * 从遍历开始就获得该桶的锁，避免其他线程同时修改链表
+   */
+  pthread_mutex_lock(&bucket_locks[i]);
+
   for (e = table[i]; e != 0; e = e->next) {
     if (e->key == key)
       break;
@@ -54,7 +69,10 @@ void put(int key, int value)
     // the new is new.
     insert(key, value, &table[i], table[i]);
   }
-
+  /*
+   * 当前桶的读写已经结束，释放互斥锁。
+   */
+  pthread_mutex_unlock(&bucket_locks[i]);
 }
 
 static struct entry*
@@ -62,12 +80,17 @@ get(int key)
 {
   int i = key % NBUCKET;
 
+  /*
+   * 查找期间保护当前桶的链表结构
+   * 防止与可能存在的写操作发生数据竞争
+   */
+  pthread_mutex_lock(&bucket_locks[i]);
 
   struct entry *e = 0;
   for (e = table[i]; e != 0; e = e->next) {
     if (e->key == key) break;
   }
-
+  pthread_mutex_unlock(&bucket_locks[i]);
   return e;
 }
 
@@ -111,6 +134,17 @@ main(int argc, char *argv[])
     exit(-1);
   }
   nthread = atoi(argv[1]);
+
+  /*
+   * 初始化每一个哈希桶对应的互斥锁
+   */
+  for(int i = 0; i < NBUCKET; i++){
+    if(pthread_mutex_init(&bucket_locks[i], NULL) != 0){
+      fprintf(stderr, "pthread_mutex_init failed for bucket %d\n", i);
+      exit(1);
+    }
+  }
+
   tha = malloc(sizeof(pthread_t) * nthread);
   srandom(0);
   assert(NKEYS % nthread == 0);
@@ -144,6 +178,13 @@ main(int argc, char *argv[])
     assert(pthread_join(tha[i], &value) == 0);
   }
   t1 = now();
+
+  /*
+   * 所有工作线程结束后，销毁互斥锁。
+   */
+  for(int i = 0; i < NBUCKET; i++){
+    pthread_mutex_destroy(&bucket_locks[i]);
+  }
 
   printf("%d gets, %.3f seconds, %.0f gets/second\n",
          NKEYS*nthread, t1 - t0, (NKEYS*nthread) / (t1 - t0));
