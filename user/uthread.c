@@ -10,15 +10,39 @@
 #define STACK_SIZE  8192
 #define MAX_THREAD  4
 
+/*
+ * 保存线程切换时必须保留的寄存器
+ */
+struct thread_context {
+  uint64 ra;
+  uint64 sp;
+  uint64 s0;
+  uint64 s1;
+  uint64 s2;
+  uint64 s3;
+  uint64 s4;
+  uint64 s5;
+  uint64 s6;
+  uint64 s7;
+  uint64 s8;
+  uint64 s9;
+  uint64 s10;
+  uint64 s11;
+};
 
 struct thread {
   char       stack[STACK_SIZE]; /* the thread's stack */
   int        state;             /* FREE, RUNNING, RUNNABLE */
+
+  /*
+   * 保存该线程暂停时的处理器状态。
+   */
+  struct thread_context context;
 };
 struct thread all_thread[MAX_THREAD];
 struct thread *current_thread;
 extern void thread_switch(uint64, uint64);
-              
+
 void 
 thread_init(void)
 {
@@ -58,24 +82,56 @@ thread_schedule(void)
     next_thread->state = RUNNING;
     t = current_thread;
     current_thread = next_thread;
-    /* YOUR CODE HERE
-     * Invoke thread_switch to switch from t to next_thread:
-     * thread_switch(??, ??);
+    /*
+     * 保存旧线程上下文，并恢复新线程上下文。
      */
+    thread_switch(
+      (uint64)&t->context,
+      (uint64)&current_thread->context
+    );
   } else
     next_thread = 0;
 }
-
-void 
+              
+void
 thread_create(void (*func)())
 {
   struct thread *t;
 
-  for (t = all_thread; t < all_thread + MAX_THREAD; t++) {
-    if (t->state == FREE) break;
+  for(t = all_thread; t < all_thread + MAX_THREAD; t++){
+    if(t->state == FREE) break;
   }
+
+  /*
+   * 无可用线程槽时不能继续创建。
+   */
+  if(t >= all_thread + MAX_THREAD){
+    printf("thread_create: no free thread\n");
+    return;
+  }
+
+  /*
+   * 清除该线程以前留下的寄存器状态。
+   */
+  memset(&t->context, 0, sizeof(t->context));
+
+  /*
+   * 新线程第一次被恢复时，thread_switch 最终执行 ret。
+   * 因此将 ra 设置为入口函数地址，使 ret 跳转到 func。
+   */
+  t->context.ra = (uint64)func;
+
+  /*
+   * RISC-V 栈向低地址增长，因此初始 sp 指向栈顶。
+   * 同时将地址向下对齐到 16 字节边界。
+   */
+  t->context.sp =
+      ((uint64)t->stack + STACK_SIZE) & ~((uint64)0xf);
+
+  /*
+   * 所有初始状态准备完成后，线程才可被调度。
+   */
   t->state = RUNNABLE;
-  // YOUR CODE HERE
 }
 
 void 
