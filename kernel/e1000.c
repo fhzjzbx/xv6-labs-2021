@@ -174,6 +174,83 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver an mbuf for each packet (using net_rx()).
   //
+
+  for(;;){
+    uint32 index;
+    struct rx_desc *desc;
+    struct mbuf *received_mbuf;
+    struct mbuf *new_mbuf;
+
+    /*
+     * 接收描述符环、rx_mbufs 数组和 RDT 寄存器都是共享状态
+     * 因此在检查和更新它们时需要获得网卡锁
+     */
+    acquire(&e1000_lock);
+
+    /*
+     * RDT 指向软件最后处理并归还给硬件的描述符
+     * 所以下一个可能包含新数据包的位置是 RDT 加一
+     */
+    index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    desc = &rx_ring[index];
+
+    /*
+     * DD 未设置表示网卡尚未在该描述符中完成数据包接收
+     * 由于接收环按顺序处理，此时可以停止本轮扫描
+     */
+    if((desc->status & E1000_RXD_STAT_DD) == 0){
+      release(&e1000_lock);
+      return;
+    }
+
+    /*
+     * 保存已经接收到数据包的旧 mbuf。
+     * 描述符中的 length 是网卡实际写入的数据长度。
+     */
+    received_mbuf = rx_mbufs[index];
+    received_mbuf->len = desc->length;
+
+    /*
+     * 为当前描述符分配新的空缓冲区。
+     * 旧缓冲区即将交给上层协议栈，不能继续交给网卡使用。
+     */
+    new_mbuf = mbufalloc(0);
+    if(new_mbuf == 0){
+      release(&e1000_lock);
+      panic("e1000_recv: mbufalloc");
+    }
+
+    /*
+     * 将新的缓冲区安装到接收环中。
+     */
+    rx_mbufs[index] = new_mbuf;
+    desc->addr = (uint64)new_mbuf->head;
+
+    /*
+     * 清除完成状态，将描述符重新交还给硬件。
+     */
+    desc->status = 0;
+
+    /*
+     * 告诉 E1000：该描述符已经处理完毕，可以再次用于接收。
+     */
+    regs[E1000_RDT] = index;
+
+    /*
+     * 在调用 net_rx() 前释放网卡锁。
+     *
+     * net_rx() 处理 ARP 请求时可能调用 e1000_transmit()
+     * 发送 ARP Reply。如果收发共用同一把锁，而这里不先释放，
+     * 将产生重复获取同一自旋锁的风险。
+     */
+    release(&e1000_lock);
+
+    /*
+     * 把收到的数据包交给 Ethernet、ARP、IP 和 UDP 协议处理层。
+     * 从此处开始，旧 mbuf 的所有权转移给网络协议栈。
+     */
+    net_rx(received_mbuf);
+  }
 }
 
 void
