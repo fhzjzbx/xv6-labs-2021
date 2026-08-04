@@ -102,6 +102,65 @@ e1000_transmit(struct mbuf *m)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after sending.
   //
+  uint32 index;
+  struct  tx_desc *desc;
+
+  /*
+   * 发送环和发送缓冲区数组可能被多个进程同时访问
+   * 因此整个描述符提交过程需要互斥保护
+   */
+  acquire(&e1000_lock);
+  
+  /*
+   * TDT 指向驱动下一次应填写的发送描述符。
+   */
+  index = regs[E1000_TDT];
+  desc = &tx_ring[index];
+
+  /*
+   * DD 未设置表示网卡尚未完成该描述符之前的发送任务。
+   * 当前不能覆盖该描述符，因此返回失败。
+   */
+  if((desc->status & E1000_TXD_STAT_DD) == 0){
+    release(&e1000_lock);
+    return -1;
+  }
+
+  /*
+   * 描述符已经由硬件处理完成。
+   * 此时可以安全释放该位置上一次保存的 mbuf。
+   */
+  if(tx_mbufs[index] != 0){
+    mbuffree(tx_mbufs[index]);
+    tx_mbufs[index] = 0;
+  }
+
+  /*
+   * 将当前网络包的数据地址和长度写入发送描述符
+   */
+  desc->addr = (uint64)m->head;
+  desc->length = m->len;
+
+  /*
+   * EOP 表示当前描述符结束一个完整网络包
+   * RS 要求硬件在完成发送后更新描述符状态
+   */
+  desc->cmd = E1000_TXD_CMD_EOP |
+              E1000_TXD_CMD_RS;
+
+  /*
+   * 保存 mbuf 指针。
+   * 现在不能立即释放，必须等网卡完成 DMA
+   */
+  tx_mbufs[index] = m;
+
+  /*
+   * 推进发送环尾指针。
+   * 写入 TDT 后，E1000 才会看到新的发送任务。
+   */
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+
+  release(&e1000_lock);
   
   return 0;
 }
