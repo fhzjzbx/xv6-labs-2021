@@ -286,8 +286,8 @@ create(char *path, short type, short major, short minor)
 uint64
 sys_open(void)
 {
-  char path[MAXPATH];
-  int fd, omode;
+  char path[MAXPATH], target[MAXPATH];
+  int fd, omode, depth;
   struct file *f;
   struct inode *ip;
   int n;
@@ -309,6 +309,57 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+
+    /*
+    * 沿符号链接链查找最终目标
+    * O_NOFOLLOW 表示调用者需要打开链接 inode 本身
+    */
+    depth = 0;
+
+    while(ip->type == T_SYMLINK && (omode & O_NOFOLLOW) == 0){
+      /*
+      * 使用最大深度限制检测符号链接循环
+      */
+      if(depth >= 10){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      depth++;
+
+      /*
+      * 读取符号链接 inode 中保存的目标路径
+      */
+      memset(target, 0, sizeof(target));
+
+      n = readi(ip, 0, (uint64)target, 0, sizeof(target));
+
+      if(n <= 0){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      /*
+      * 当前 inode 是链接本身
+      * 在解析目标前释放其锁和引用
+      */
+      iunlockput(ip);
+
+      /*
+      * 根据目标路径重新查找 inode
+      * 若目标不存在，则该符号链接是悬空链接，open 失败
+      */
+      ip = namei(target);
+      if(ip == 0){
+        end_op();
+        return -1;
+      }
+
+      ilock(ip);
+    }
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -482,5 +533,57 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+/*
+ * 创建符号链接：
+ *
+ * target 是链接中保存的目标路径；
+ * path 是新符号链接自身的路径。
+ */
+uint64
+sys_symlink(void){
+  char target[MAXPATH];
+  char path[MAXPATH];
+  struct inode *ip;
+  int length;
+
+  /*
+   * 从用户地址空间复制两个路径参数。
+   */
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+/*
+   * 创建一个类型为 T_SYMLINK 的新 inode。
+   *
+   * create() 成功返回时，ip 已经被锁定。
+   * target 此时不需要存在。
+   */
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  /*
+   * 将目标路径连同字符串结束符写入链接 inode。
+   */
+  length = strlen(target) + 1;
+
+  if(writei(ip, 0, (uint64)target, 0, length) != length){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  /*
+   * 释放 inode 锁和引用，并提交事务。
+   */
+  iunlockput(ip);
+  end_op();
+
   return 0;
 }
