@@ -26,6 +26,15 @@
 // only one device
 struct superblock sb; 
 
+/*
+ * 记录下一次分配磁盘块时的建议起始位置
+ *
+ * 该游标只影响搜索顺序，不属于磁盘文件系统格式
+ * 系统重新启动后从零开始不会影响正确性
+ */
+static struct spinlock balloc_hint_lock;
+static uint balloc_hint;
+
 // Read the super block.
 static void
 readsb(int dev, struct superblock *sb)
@@ -39,10 +48,20 @@ readsb(int dev, struct superblock *sb)
 
 // Init fs
 void
-fsinit(int dev) {
+fsinit(int dev)
+{
   readsb(dev, &sb);
+
   if(sb.magic != FSMAGIC)
     panic("invalid file system");
+
+  /*
+   * 初始化空闲块搜索游标
+   * 游标只在内存中使用，不需要写入磁盘
+   */
+  initlock(&balloc_hint_lock, "balloc_hint");
+  balloc_hint = 0;
+
   initlog(dev, &sb);
 }
 
@@ -58,30 +77,136 @@ bzero(int dev, int bno)
   brelse(bp);
 }
 
+
+/*
+ * 在磁盘块区间 [start, end) 中查找一个空闲块
+ *
+ * 找到后更新位图、清零数据块并返回块号
+ * 没有找到时返回 0
+ */
+static uint
+balloc_scan(uint dev, uint start, uint end)
+{
+  uint b;
+  uint base;
+  uint blockno;
+  int bi;
+  int limit;
+  int m;
+  struct buf *bp;
+
+  /*
+   * 按位图块逐段扫描
+   */
+  for(b = start; b < end; ){
+    /*
+     * 当前位图块所覆盖的第一个磁盘块号
+     */
+    base = (b / BPB) * BPB;
+
+    /*
+     * 读取包含块号 b 对应位的位图块。
+     */
+    bp = bread(dev, BBLOCK(b, sb));
+
+    /*
+     * 第一个需要检查的位
+     * 如果 start 位于位图块中间，则不必从该位图块的第零位重扫
+     */
+    bi = b - base;
+
+    /*
+     * 当前位图块最多包含 BPB 个磁盘块的状态
+     * 最后一段可能不足 BPB
+     */
+    limit = BPB;
+    if(base + (uint)limit > end)
+      limit = end - base;
+
+    for(; bi < limit; bi++){
+      blockno = base + bi;
+      m = 1 << (bi % 8);
+
+      if((bp->data[bi / 8] & m) == 0){
+        /*
+         * 将该块标记为已使用
+         */
+        bp->data[bi / 8] |= m;
+        log_write(bp);
+        brelse(bp);
+
+        /*
+         * 新分配块仍然必须清零
+         */
+        bzero(dev, blockno);
+
+        return blockno;
+      }
+    }
+
+    brelse(bp);
+
+    /*
+     * 进入下一个位图块覆盖的范围
+     */
+    b = base + BPB;
+  }
+
+  return 0;
+}
+
 // Blocks.
 
-// Allocate a zeroed disk block.
+/*
+ * 分配一个已经清零的磁盘块
+ *
+ * 使用 next-fit 策略，从上一次成功分配的位置之后开始查找
+ * 避免每次分配都从磁盘位图开头重复扫描
+ */
 static uint
 balloc(uint dev)
 {
-  int b, bi, m;
-  struct buf *bp;
+  uint start;
+  uint blockno;
 
-  bp = 0;
-  for(b = 0; b < sb.size; b += BPB){
-    bp = bread(dev, BBLOCK(b, sb));
-    for(bi = 0; bi < BPB && b + bi < sb.size; bi++){
-      m = 1 << (bi % 8);
-      if((bp->data[bi/8] & m) == 0){  // Is block free?
-        bp->data[bi/8] |= m;  // Mark block in use.
-        log_write(bp);
-        brelse(bp);
-        bzero(dev, b + bi);
-        return b + bi;
-      }
-    }
-    brelse(bp);
+  /*
+   * 只在读取游标时短暂持有自旋锁
+   * 不能持有该锁执行 bread()，因为磁盘读取可能睡眠
+   */
+  acquire(&balloc_hint_lock);
+  start = balloc_hint;
+  release(&balloc_hint_lock);
+
+  if(start >= sb.size)
+    start = 0;
+
+  /*
+   * 第一段：从游标位置扫描到文件系统末尾
+   */
+  blockno = balloc_scan(dev, start, sb.size);
+
+  /*
+   * 第一段未找到时，从开头扫描到原游标位置
+   * 从而保证仍然能够找到游标之前的空闲块
+   */
+  if(blockno == 0 && start > 0)
+    blockno = balloc_scan(dev, 0, start);
+
+  if(blockno != 0){
+    /*
+     * 下一次从刚分配块的后一个位置开始
+     */
+    acquire(&balloc_hint_lock);
+
+    balloc_hint = blockno + 1;
+    if(balloc_hint >= sb.size)
+      balloc_hint = 0;
+
+    release(&balloc_hint_lock);
+
+    return blockno;
   }
+
   panic("balloc: out of blocks");
 }
 
