@@ -484,3 +484,21 @@ sys_pipe(void)
   }
   return 0;
 }
+
+/*
+ * 建立文件到用户虚拟地址空间的映射
+ */
+uint64
+sys_mmap(void)
+{
+  return (uint64)-1;
+}
+
+/*
+ * 解除用户虚拟地址空间中的文件映射
+ */
+uint64
+sys_munmap(void)
+{
+  return (uint64)-1;
+}
