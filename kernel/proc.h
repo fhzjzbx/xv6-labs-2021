@@ -82,6 +82,22 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+/*
+ * 描述一段由 mmap() 创建的用户虚拟地址区域
+ *
+ * VMA 仅记录映射关系，不直接保存物理页面
+ * 映射页面将在用户首次访问时通过页面故障按需建立
+ */
+struct vma {
+  int used;             // 当前 VMA 槽位是否正在使用
+  uint64 addr;          // 映射区域的起始虚拟地址
+  uint64 length;        // 用户请求映射的字节数
+  int prot;             // PROT_READ、PROT_WRITE 等访问权限
+  int flags;            // MAP_SHARED 或 MAP_PRIVATE
+  struct file *file;    // 被映射文件的内核文件对象
+  uint64 offset;        // 映射对应的文件起始偏移
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -103,6 +119,7 @@ struct proc {
   struct trapframe *trapframe; // data page for trampoline.S
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
+  struct vma vmas[NVMA];       // 当前进程的文件映射区域表
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
 };

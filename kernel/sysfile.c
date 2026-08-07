@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "riscv.h"
+#include "memlayout.h"
 #include "defs.h"
 #include "param.h"
 #include "stat.h"
@@ -487,11 +488,155 @@ sys_pipe(void)
 
 /*
  * 建立文件到用户虚拟地址空间的映射
+ * 当前函数只创建 VMA 元数据，不分配物理页面，也不读取文件内容
+ * 映射页面将在用户首次访问时，由页面故障处理程序按需建立
  */
 uint64
 sys_mmap(void)
 {
-  return (uint64)-1;
+  int length, prot, flags, offset, slot;
+  uint64 requested_addr, map_length, map_top, map_addr;
+  struct file *file;
+  struct proc *p;
+  struct vma *v;
+  int i;
+
+  /*
+   * 读取 mmap(addr, length, prot, flags, fd, offset)的六个系统调用参数
+   */
+  argaddr(0, &requested_addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+
+  if(argfd(4, 0, &file) < 0)
+    return (uint64)-1;
+
+  argint(5, &offset);
+
+  /*
+   * 假定 addr 和 offset 均为零
+   */
+  if(requested_addr != 0 || offset != 0)
+    return (uint64)-1;
+
+  /*
+   * 映射长度必须为正数
+   */
+  if(length <= 0)
+    return (uint64)-1;
+
+  /*
+   * 只支持 MAP_SHARED 和 MAP_PRIVATE
+   */
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return (uint64)-1;
+
+  /*
+   * 只要求支持可读、可写或同时可读可写的映射
+   */
+  if((prot & ~(PROT_READ | PROT_WRITE)) != 0)
+    return (uint64)-1;
+
+  if((prot & (PROT_READ | PROT_WRITE)) == 0)
+    return (uint64)-1;
+
+  /*
+   * 页面故障处理时需要从文件中读取数据
+   * 因此被映射文件必须具有读取权限
+   */
+  if(file->readable == 0)
+    return (uint64)-1;
+
+  /*
+   * MAP_SHARED 的可写映射最终需要把修改写回文件
+   * 因此底层文件必须以可写方式打开
+   *
+   * MAP_PRIVATE 的修改不写回原文件，所以不要求文件本身具有写权限
+   */
+  if(flags == MAP_SHARED && (prot & PROT_WRITE) && file->writable == 0)
+    return (uint64)-1;
+
+  /*
+   * 当前实验只处理 inode 文件映射
+   * 不对管道或设备文件建立 mmap 映射
+   */
+  if(file->type != FD_INODE)
+    return (uint64)-1;
+  
+  p = myproc();
+  slot = -1;
+
+  /*
+   * 从进程的固定 VMA 数组中寻找空闲槽位。
+   */
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used == 0){
+      slot = i;
+      break;
+    }
+  }
+
+  if(slot < 0)
+    return (uint64)-1;
+
+  /*
+   * 物理页面按整页建立映射，因此地址空间占用长度
+   * 需要向上取整到页面边界。
+   */
+  map_length = PGROUNDUP((uint64)length);
+
+  if(map_length == 0)
+    return (uint64)-1;
+
+  /*
+   * mmap 区域从 TRAPFRAME 下方开始向低地址增长。
+   * map_top 表示当前能够使用的最高边界。
+   */
+  map_top = TRAPFRAME;
+
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used && p->vmas[i].addr < map_top)
+      map_top = p->vmas[i].addr;
+  }
+
+  /*
+   * 检查减法是否会下溢。
+   */
+  if(map_length > map_top)
+    return (uint64)-1;
+
+  map_addr = map_top - map_length;
+
+  /*
+   * mmap 区域不能向下覆盖进程已有的代码、数据、
+   * 用户栈或由 sbrk() 扩展的堆区域。
+   */
+  if(map_addr < PGROUNDUP(p->sz))
+    return (uint64)-1;
+
+  v = &p->vmas[slot];
+
+  /*
+   * 填写 VMA 元数据。
+   */
+  v->used = 1;
+  v->addr = map_addr;
+  v->length = (uint64)length;
+  v->prot = prot;
+  v->flags = flags;
+  v->offset = (uint64)offset;
+
+  /*
+   * VMA 必须独立持有文件引用。
+   * 即使用户随后关闭原文件描述符，映射也应继续有效。
+   */
+  v->file = filedup(file);
+
+  /*
+   * 此处只返回预留的虚拟地址，不建立任何页表项。
+   */
+  return map_addr;
 }
 
 /*
