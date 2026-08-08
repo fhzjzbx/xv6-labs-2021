@@ -37,6 +37,7 @@ mmap_page_fault(struct proc *p, uint64 faultva, uint64 scause)
   char * mem;
   int perm;
   struct vma *v = 0;
+  pte_t *pte;
   int n, i;
 
   /*
@@ -78,7 +79,7 @@ mmap_page_fault(struct proc *p, uint64 faultva, uint64 scause)
   /*
    * 防止对已经存在的页面重复建立映射。
    */
-  pte_t *pte = walk(p->pagetable, va, 0);
+  pte = walk(p->pagetable, va, 0);
 
   if(pte != 0 && (*pte & PTE_V))
     return -1;

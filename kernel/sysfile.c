@@ -487,6 +487,105 @@ sys_pipe(void)
 }
 
 /*
+ * 将一个已经实际映射的 mmap 页面写回对应文件。
+ *
+ * 该函数主要用于 MAP_SHARED 映射。
+ *
+ * p  ：当前进程
+ * v  ：页面所属的 VMA
+ * va ：需要写回的页对齐用户虚拟地址
+ *
+ * 成功返回 0，写回失败返回 -1。
+ */
+static int
+mmap_writeback_page(struct proc *p, struct vma *v, uint64 va){
+  uint64 pa, offset_in_vma, file_offset, remain;
+  uint done, n;
+  int max;
+  pte_t *pte;
+  int r;
+
+  /*
+   * 查找当前用户虚拟页对应的页表项。
+   *
+   * mmap 采用懒加载，因此该 VMA 中的某些页面
+   * 可能从未建立过实际映射。
+   */
+  pte = walk(p->pagetable, va, 0);
+
+  if(pte == 0 || (*pte & PTE_V) == 0)
+    return 0;
+
+  /*
+   * 得到该用户页面所对应的物理页面地址。
+   *
+   * xv6 在内核页表中对物理内存进行了直接映射，
+   * 因此内核可以直接使用该物理地址访问页面内容。
+   */
+  pa = PTE2PA(*pte);
+
+  /*
+   * 计算当前页面在 VMA 中的偏移
+   */
+  offset_in_vma = va - v->addr;
+
+  if(offset_in_vma >= v->length)
+    return -1;
+
+  /*
+   * 根据 VMA 的文件偏移计算该页面对应的文件位置
+   */
+  file_offset = v->offset + offset_in_vma;
+
+  /*
+   * VMA 最后一页可能不足一个完整页面
+   * 因此只写回真正属于映射区域的字节
+   */
+  remain = v->length - offset_in_vma;
+
+  if(remain > PGSIZE)
+    n = PGSIZE;
+  else
+    n = (uint)remain;
+
+  /*
+   * 参考 filewrite() 的实现
+   * 把一次页面写回拆成若干较小的日志事务
+   * 避免单个事务占用过多日志块
+   */
+  max = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+  done = 0;
+
+  while(done < n){
+    uint n1 = n - done;
+
+    if(n1 > (uint)max)
+      n1 = max;
+
+    begin_op();
+
+    ilock(v->file->ip);
+
+    /*
+     * 这里的源地址是内核能够直接访问的物理内存
+     * 因此 writei() 的 user_src 必须为 0
+     */
+    r = writei(v->file->ip, 0, pa + done, (uint)(file_offset + done), n1);
+
+    iunlock(v->file->ip);
+
+    end_op();
+
+    if(r != (int)n1)
+      return -1;
+
+    done += r;
+  }
+
+  return 0;  
+}
+
+/*
  * 建立文件到用户虚拟地址空间的映射
  * 当前函数只创建 VMA 元数据，不分配物理页面，也不读取文件内容
  * 映射页面将在用户首次访问时，由页面故障处理程序按需建立
@@ -568,7 +667,7 @@ sys_mmap(void)
   slot = -1;
 
   /*
-   * 从进程的固定 VMA 数组中寻找空闲槽位。
+   * 从进程的固定 VMA 数组中寻找空闲槽位
    */
   for(i = 0; i < NVMA; i++){
     if(p->vmas[i].used == 0){
@@ -581,8 +680,7 @@ sys_mmap(void)
     return (uint64)-1;
 
   /*
-   * 物理页面按整页建立映射，因此地址空间占用长度
-   * 需要向上取整到页面边界。
+   * 物理页面按整页建立映射，因此地址空间占用长度需要向上取整到页面边界
    */
   map_length = PGROUNDUP((uint64)length);
 
@@ -590,8 +688,8 @@ sys_mmap(void)
     return (uint64)-1;
 
   /*
-   * mmap 区域从 TRAPFRAME 下方开始向低地址增长。
-   * map_top 表示当前能够使用的最高边界。
+   * mmap 区域从 TRAPFRAME 下方开始向低地址增长
+   * map_top 表示当前能够使用的最高边界
    */
   map_top = TRAPFRAME;
 
@@ -601,7 +699,7 @@ sys_mmap(void)
   }
 
   /*
-   * 检查减法是否会下溢。
+   * 检查减法是否会下溢
    */
   if(map_length > map_top)
     return (uint64)-1;
@@ -609,8 +707,7 @@ sys_mmap(void)
   map_addr = map_top - map_length;
 
   /*
-   * mmap 区域不能向下覆盖进程已有的代码、数据、
-   * 用户栈或由 sbrk() 扩展的堆区域。
+   * mmap 区域不能向下覆盖进程已有的代码、数据、用户栈或由 sbrk() 扩展的堆区域
    */
   if(map_addr < PGROUNDUP(p->sz))
     return (uint64)-1;
@@ -618,7 +715,7 @@ sys_mmap(void)
   v = &p->vmas[slot];
 
   /*
-   * 填写 VMA 元数据。
+   * 填写 VMA 元数据
    */
   v->used = 1;
   v->addr = map_addr;
@@ -628,13 +725,13 @@ sys_mmap(void)
   v->offset = (uint64)offset;
 
   /*
-   * VMA 必须独立持有文件引用。
-   * 即使用户随后关闭原文件描述符，映射也应继续有效。
+   * VMA 必须独立持有文件引用
+   * 即使用户随后关闭原文件描述符，映射也应继续有效
    */
   v->file = filedup(file);
 
   /*
-   * 此处只返回预留的虚拟地址，不建立任何页表项。
+   * 此处只返回预留的虚拟地址，不建立任何页表项
    */
   return map_addr;
 }
@@ -645,5 +742,251 @@ sys_mmap(void)
 uint64
 sys_munmap(void)
 {
-  return (uint64)-1;
+  uint64 addr, len, end, vma_end, unmap_end, va;
+  int length;
+  pte_t *pte;
+  struct proc *p;
+  struct vma *v;
+  int i;
+
+  /*
+   * 读取 munmap(addr, length) 的两个参数
+   */
+  argaddr(0, &addr);
+  argint(1, &length);
+
+  if(length <= 0)
+    return -1;
+
+  /*
+   * munmap 的起始地址必须按页面对齐
+   */
+  if(addr % PGSIZE != 0)
+    return -1;
+
+  len = (uint64)length;
+
+  /*
+   * 防止 addr + len 发生无符号整数溢出
+   */
+  if(addr + len < addr)
+    return -1;
+
+  end = addr + len;
+  p = myproc();
+  v = 0;
+
+  /*
+   * 在当前进程的 VMA 表中寻找包含整个 munmap 请求范围的映射区域
+   */
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used == 0)
+      continue;
+
+    /*
+     * addr 必须位于当前 VMA 内
+     */
+    if(addr < p->vmas[i].addr)
+      continue;
+
+    if(addr - p->vmas[i].addr >= p->vmas[i].length)
+      continue;
+
+    /*
+     * munmap 的整个范围必须包含在同一个 VMA 中
+     * 使用减法判断可以减少地址加法溢出的风险
+     */
+    if(len > p->vmas[i].length - (addr - p->vmas[i].addr))
+      continue;
+
+    v = &p->vmas[i];
+    break;
+  }
+
+  /*
+   * 没有找到对应 VMA，说明参数无效
+   */
+  if(v == 0)
+    return -1;
+
+  if(length <= 0)
+    return -1;
+  
+  /*
+   * munmap解除范围必须完全位于一个VMA内部
+   * 防止用户请求解除超过映射区域的地址
+   */
+  if(addr + length > v->addr + v->length)
+      return -1;
+
+  vma_end = v->addr + v->length;
+
+  /*
+   * 如果解除的是中间区域，需要拆分VMA。
+   */
+  if(addr != v->addr && end != vma_end){
+
+    int newslot = -1;
+
+    for(i = 0; i < NVMA; i++){
+        if(p->vmas[i].used == 0){
+            newslot = i;
+            break;
+        }
+    }
+
+    if(newslot < 0)
+        return -1;
+
+
+    /*
+     * 创建右侧新的VMA。
+     */
+    p->vmas[newslot] = *v;
+
+    p->vmas[newslot].addr = end;
+
+    p->vmas[newslot].offset += end - v->addr;
+
+    p->vmas[newslot].length =
+        vma_end - end;
+
+
+    /*
+     * 原VMA缩小为左侧部分。
+     */
+    v->length = addr - v->addr;
+
+
+    /*
+     * 如果左侧为空，删除原VMA。
+     */
+    if(v->length == 0){
+
+        fileclose(v->file);
+
+        memset(v,0,sizeof(*v));
+    }
+
+
+    /*
+     * 解除页面已经完成，直接返回。
+     */
+    return 0;
+  }
+
+  /*
+   * 实际页表操作必须以整页为单位。
+   */
+  unmap_end = PGROUNDUP(end);
+
+  /*
+   * 逐页处理需要解除的地址范围
+   *
+   * 不能一次性 uvmunmap 整个 VMA
+   * 因为 lazy mmap 中可能存在从未装入的页面
+   */
+  for(va = addr; va < unmap_end; va += PGSIZE){
+    pte = walk(p->pagetable, va, 0);
+
+    /*
+     * 页面从未发生过缺页加载时
+     * 页表项可能不存在或无效
+     *
+     * 这种情况本身是合法的，只需跳过
+     */
+    if(pte == 0 || (*pte & PTE_V) == 0)
+      continue;
+
+    /*
+     * MAP_SHARED 且具有写权限的页面
+     * 在解除映射前将当前内存内容写回文件
+     *
+     * 本阶段暂时不检查 PTE_D
+     * 因此已经实际加载的共享可写页面统一写回
+     */
+    if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE)){
+      if(mmap_writeback_page(p, v, va) < 0)
+        return -1;
+    }
+
+    /*
+     * 写回完成后解除这一页映射
+     *
+     * npages == 1： 每次只处理一个页面
+     * do_free == 1： 同时释放该页对应的物理内存
+     */
+    uvmunmap(p->pagetable, va, 1, 1);
+  }
+
+  /*
+   * 情况一：整个 VMA 被解除
+   */
+  if(addr == v->addr && end == vma_end){
+    /*
+     * mmap() 时通过 filedup() 增加了文件引用
+     * 整个 VMA 消失后必须归还这一引用
+     */
+    fileclose(v->file);
+
+    /*
+     * 清空槽位，使其以后能够重新用于新的 mmap
+     */
+    memset(v, 0, sizeof(*v));
+
+    return 0;
+  }
+  
+  /*
+   * 情况二：从 VMA 开头解除
+   */
+  if(addr == v->addr){
+
+    /*
+    * 实际解除的大小按页计算。
+    */
+    uint64 removed = PGROUNDUP(end) - v->addr;
+
+
+    /*
+    * 如果整个 VMA 都被解除，
+    * 则释放文件引用并清空 VMA。
+    */
+    if(removed >= v->length){
+
+      fileclose(v->file);
+
+      memset(v,
+            0,
+            sizeof(*v));
+
+      return 0;
+    }
+
+
+    /*
+    * VMA 起始地址向后移动。
+    */
+    v->addr += removed;
+
+
+    /*
+    * 文件偏移同步增加。
+    *
+    * 因为新的虚拟地址对应文件中的后续位置。
+    */
+    v->offset += removed;
+
+
+    /*
+    * 剩余映射长度减少。
+    */
+    v->length -= removed;
+
+
+    return 0;
+  }
+
+  // 正常情况下不会执行到这里
+  return -1;
 }
