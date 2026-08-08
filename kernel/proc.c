@@ -290,6 +290,29 @@ fork(void)
   }
   np->sz = p->sz;
 
+  /*
+   * 复制父进程的 mmap 区域信息。
+   *
+   * mmap 使用 lazy allocation，
+   * 因此这里只复制 VMA 元数据，
+   * 不复制 mmap 对应的物理页面。
+   */
+  for(i = 0; i < NVMA; i++){
+
+    if(p->vmas[i].used){
+
+      /*
+      * 复制整个 VMA 描述结构。
+      */
+      np->vmas[i] = p->vmas[i];
+
+      /*
+      * 子进程需要独立持有文件引用。
+      */
+      filedup(np->vmas[i].file);
+    }
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -344,6 +367,65 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  /*
+   * 进程退出时自动释放所有 mmap 映射。
+   *
+   * 用户可能没有主动调用 munmap，
+   * 因此退出前必须解除所有 mmap 页面，
+   * 否则页表中会残留叶子 PTE，
+   * 最终导致 freewalk: leaf。
+   */
+  for(int i = 0; i < NVMA; i++){
+
+    if(p->vmas[i].used){
+
+      /*
+       * 解除该 VMA 中已经实际加载的页面。
+       */
+      uint64 addr = p->vmas[i].addr;
+      uint64 length = p->vmas[i].length;
+
+      uint64 va;
+
+      for(va = PGROUNDDOWN(addr);
+          va < addr + length;
+          va += PGSIZE){
+
+        pte_t *pte;
+
+        pte = walk(p->pagetable, va, 0);
+
+        /*
+         * lazy mmap 中，
+         * 没访问过的页面没有 PTE，
+         * 直接跳过。
+         */
+        if(pte == 0)
+          continue;
+
+        if((*pte & PTE_V) == 0)
+          continue;
+
+
+        uvmunmap(p->pagetable,
+                va,
+                1,
+                1);
+      }
+
+
+      /*
+       * 释放 VMA 保存的文件引用。
+       */
+      fileclose(p->vmas[i].file);
+
+
+      memset(&p->vmas[i],
+            0,
+            sizeof(struct vma));
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
